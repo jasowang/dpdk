@@ -1401,15 +1401,19 @@ vhost_enqueue_single_packed(struct virtio_net *dev,
 	return 0;
 }
 
+#define PAGE_SIZE 4096
+#define PAGE_MASK ~(PAGE_SIZE - 1)
+
 static __rte_noinline uint32_t
 virtio_dev_rx_split(struct virtio_net *dev, struct vhost_virtqueue *vq,
 	struct rte_mbuf **pkts, uint32_t count)
 	__rte_shared_locks_required(&vq->access_lock)
 	__rte_shared_locks_required(&vq->iotlb_lock)
 {
-	uint32_t pkt_idx = 0;
+	uint32_t pkt_idx = 0, i, nr_zc = 0;
 	uint16_t num_buffers;
 	struct buf_vector buf_vec[BUF_VECTOR_MAX];
+	struct buf_vector zc_vec[4096];
 	uint16_t avail_head;
 
 	/*
@@ -1424,6 +1428,7 @@ virtio_dev_rx_split(struct virtio_net *dev, struct vhost_virtqueue *vq,
 	for (pkt_idx = 0; pkt_idx < count; pkt_idx++) {
 		uint64_t pkt_len = pkts[pkt_idx]->pkt_len + dev->vhost_hlen;
 		uint16_t nr_vec = 0;
+		uint16_t j;
 
 		if (unlikely(reserve_avail_buf_split(dev, vq,
 						pkt_len, buf_vec, &num_buffers,
@@ -1445,9 +1450,26 @@ virtio_dev_rx_split(struct virtio_net *dev, struct vhost_virtqueue *vq,
 		}
 
 		vq->last_avail_idx += num_buffers;
+
+		for (i = 0; i < nr_vec; i++) {
+			if (nr_zc == 4096)
+				fprintf(stderr, "rx overflow!\n");
+			if (!(buf_vec[i].buf_addr & ~PAGE_MASK) &&
+			    !(buf_vec[i].buf_len & ~PAGE_MASK))
+				zc_vec[nr_zc++] = buf_vec[i];
+		}
 	}
 
 	do_data_copy_enqueue(dev, vq);
+
+	for (i = 0; i < nr_zc; i++) {
+#if 0
+		fprintf(stderr, "rx madvise addr %llx len %llx\n",
+			zc_vec[i].buf_addr, zc_vec[i].buf_len);
+#endif
+		madvise((void *)zc_vec[i].buf_addr, zc_vec[i].buf_len,
+			MADV_DONTNEED);
+	}
 
 	if (likely(vq->shadow_used_idx)) {
 		flush_shadow_used_ring_split(dev, vq);
@@ -3095,6 +3117,7 @@ virtio_dev_pktmbuf_prep(struct virtio_net *dev, struct rte_mbuf *pkt,
 	return -1;
 }
 
+
 __rte_always_inline
 static uint16_t
 virtio_dev_tx_split(struct virtio_net *dev, struct vhost_virtqueue *vq,
@@ -3103,9 +3126,10 @@ virtio_dev_tx_split(struct virtio_net *dev, struct vhost_virtqueue *vq,
 	__rte_shared_locks_required(&vq->access_lock)
 	__rte_shared_locks_required(&vq->iotlb_lock)
 {
-	uint16_t i;
+	uint16_t i, j, nr_zc = 0;
 	uint16_t avail_entries;
 	static bool allocerr_warned;
+	struct buf_vector zc_vec[1024];
 
 	/*
 	 * The ordering between avail index and
@@ -3175,6 +3199,23 @@ virtio_dev_tx_split(struct virtio_net *dev, struct vhost_virtqueue *vq,
 			}
 			break;
 		}
+
+		/* here to use buf_vec as well as nr_vec */
+		for (j = 0; j < nr_vec; j++) {
+			if (!(buf_vec[j].buf_addr & ~PAGE_MASK) &&
+			    !(buf_vec[j].buf_len & ~PAGE_MASK)) {
+				if (nr_zc == 1024)
+					fprintf(stderr, "OVERFLOW!\n");
+				zc_vec[nr_zc] = buf_vec[j];
+#if 0
+				fprintf(stderr, "[%d] addr %llx len %llx\n",
+					nr_zc,
+					zc_vec[nr_zc].buf_addr,
+					zc_vec[nr_zc].buf_len);
+#endif
+				nr_zc++;
+			}
+		}
 	}
 
 	if (unlikely(count != i))
@@ -3183,6 +3224,17 @@ virtio_dev_tx_split(struct virtio_net *dev, struct vhost_virtqueue *vq,
 	if (likely(vq->shadow_used_idx)) {
 		vq->last_avail_idx += vq->shadow_used_idx;
 		do_data_copy_dequeue(vq);
+		for (j = 0; j < nr_zc; j++) {
+#if 0
+			fprintf(stderr, "TX madv [%d] addr %llx len %llx\n",
+				j,
+				zc_vec[j].buf_addr,
+				zc_vec[j].buf_len);
+#endif
+			madvise((void *)zc_vec[j].buf_addr,
+				zc_vec[j].buf_len,
+				MADV_DONTNEED);
+		}
 		flush_shadow_used_ring_split(dev, vq);
 		vhost_vring_call_split(dev, vq);
 	}
